@@ -1,5 +1,5 @@
 /*
-  xdrv_28_pcf8574.ino - PCF8574 I2C support for Tasmota
+  xdrv_28_pcf8574.ino - PCF8574 and PCF8575 I2C support for Tasmota
 
   Copyright (C) 2021  Stefan Bode and Theo Arends
 
@@ -33,6 +33,16 @@
  *  - 0X38 is reserved for other sensors
  * If the respective drivers are not used, overrides allows to recover those addresses
  * If defined, USE_MCP230xx_ADDR is also always excluded
+ *
+ * PCF8575 - 16-bit I2C IO Expander
+ *
+ * I2C Address: PCF8575  = 0x20 .. 0x27 (0x27 is only scanned if PCF8574_ADDR1_COUNT is overriden)
+ *
+ * A PCF8575 can't be told apart from a PCF8574, so its address must be set by command:
+ *   Pcf8575Addr 0x20,0x22   - Chips at 0x20 and 0x22 are PCF8575 (restarts)
+ *   Pcf8575Addr 0           - All chips are PCF8574 (restarts)
+ * A PCF8575 uses two of the MAX_PCF8574 device slots, one for P00-P07 and one for P08-P15,
+ * and shows as one device with ports D0 to D15. Its pins 1-16 are P00-P15 in a template.
  *
  * Mode 1:
  * See documentation.
@@ -91,6 +101,9 @@
 #ifndef PCF8574_ADDR2_COUNT
 #define PCF8574_ADDR2_COUNT  6
 #endif
+// PCF8575 address range from 0x20 to 0x27, selected by command Pcf8575Addr
+#define PCF8575_ADDR         0x20
+#define PCF8575_ADDR_COUNT   8
 
 //#define USE_PCF8574_MODE2         // Enable Mode2 virtual relays/buttons/switches (+2k3 code)
 //#define USE_PCF8574_SENSOR        // Enable Mode1 inputs and outputs in SENSOR message (+0k2 code)
@@ -119,7 +132,8 @@ struct PCF8574 {
   uint8_t last_input[MAX_PCF8574] = { 0 };
 #endif
   uint8_t max_connected_ports = 0;        // Max numbers of devices comming from PCF8574 modules
-  uint8_t max_devices = 0;                // Max numbers of PCF8574 modules
+  uint8_t max_devices = 0;                // Max numbers of 8-bit banks (one per PCF8574, two per PCF8575)
+  uint8_t port1 = 0;                      // Bank holds P08-P15 of a PCF8575, its P00-P07 are in the bank before
   uint8_t mode;
   uint8_t relay_max;
   uint8_t relay_offset;
@@ -135,41 +149,83 @@ uint16_t *Pcf8574_pin = nullptr;
 
 /*********************************************************************************************\
  * PCF8574 - I2C
+ *
+ * Each 8-bit bank has an index (idx). A chip uses one bank (PCF8574) or two banks (PCF8575).
+ * Chip functions take the index of the first bank of the chip (first).
 \*********************************************************************************************/
 
-uint8_t Pcf8574Read(uint8_t idx) {
-/*
-  Wire.requestFrom(Pcf8574.address[idx], (uint8_t)1);
-  return Wire.read();
-*/
-  TwoWire& myWire = I2cGetWire(Pcf8574.bus[idx]);
-  myWire.requestFrom(Pcf8574.address[idx], (uint8_t)1);
-  return myWire.read();
+uint32_t Pcf8574First(uint32_t idx) {
+  // First bank of the chip using bank idx
+  return bitRead(Pcf8574.port1, idx) ? idx -1 : idx;
 }
 
-void Pcf8574WriteData(uint8_t idx, uint8_t data) {
-  TwoWire& myWire = I2cGetWire(Pcf8574.bus[idx]);
-  myWire.beginTransmission(Pcf8574.address[idx]);
-  myWire.write(data);
+bool Pcf8574LastBank(uint32_t idx) {
+  // Bank idx is the last bank of its chip
+  return !bitRead(Pcf8574.port1, idx +1);
+}
+
+bool Pcf8574Wide(uint32_t first) {
+  // Chip is a PCF8575
+  return !Pcf8574LastBank(first);
+}
+
+uint32_t Pcf8574Chip(uint32_t idx) {
+  // Chip number (0 based) using bank idx
+  return idx - __builtin_popcount(Pcf8574.port1 & ((2 << idx) -1));
+}
+
+uint32_t Pcf8574PortOffset(uint32_t idx) {
+  // Number of the first port of bank idx within its chip
+  return bitRead(Pcf8574.port1, idx) ? 8 : 0;
+}
+
+uint32_t Pcf8574ChipMask(uint32_t first) {
+  uint32_t mask = Pcf8574.pin_mask[first];
+  if (Pcf8574Wide(first)) {
+    mask |= Pcf8574.pin_mask[first +1] << 8;
+  }
+  return mask;
+}
+
+uint32_t Pcf8574ChipRead(uint32_t first) {
+  bool wide = Pcf8574Wide(first);
+  TwoWire& myWire = I2cGetWire(Pcf8574.bus[first]);
+  myWire.requestFrom(Pcf8574.address[first], (uint8_t)((wide) ? 2 : 1));
+  uint32_t data = (uint8_t)myWire.read();              // P00-P07
+  if (wide) {
+    data |= (uint8_t)myWire.read() << 8;               // P08-P15
+  }
+  return data;
+}
+
+void Pcf8574ChipWrite(uint32_t first, uint32_t data) {
+  TwoWire& myWire = I2cGetWire(Pcf8574.bus[first]);
+  myWire.beginTransmission(Pcf8574.address[first]);
+  myWire.write((uint8_t)data);                         // P00-P07
+  if (Pcf8574Wide(first)) {
+    myWire.write((uint8_t)(data >> 8));                // P08-P15
+  }
   myWire.endTransmission();
 }
 
+uint8_t Pcf8574Read(uint8_t idx) {
+  uint32_t first = Pcf8574First(idx);
+  return Pcf8574ChipRead(first) >> (8 * (idx - first));
+}
+
 void Pcf8574Write(uint8_t idx) {
-/*
-  Wire.beginTransmission(Pcf8574.address[idx]);
-  Wire.write(Pcf8574.pin_mask[idx]);
-  Wire.endTransmission();
-*/
-  Pcf8574WriteData(idx, Pcf8574.pin_mask[idx]);
+  // Write pin_mask of all banks of the chip
+  uint32_t first = Pcf8574First(idx);
+  Pcf8574ChipWrite(first, Pcf8574ChipMask(first));
 }
 
 #ifdef USE_PCF8574_MODE2
 
 bool Pcf8574DigitalRead(uint8_t pin) {
   // pin 0 - 63
-  uint32_t chip = pin / 8;
-  uint32_t bit = pin % 8;
-  uint32_t value = Pcf8574Read(chip);
+  uint32_t chip = Pcf8574First(pin / 8);
+  uint32_t bit = pin - 8 * chip;                       // 0 - 15
+  uint32_t value = Pcf8574ChipRead(chip);
   return value & (1 << bit);
 }
 
@@ -177,21 +233,16 @@ void Pcf8574DigitalWrite(uint8_t pin, bool pin_value) {
   // pin 0 - 63
   // INPUT or INPUT_PULLUP = Pcf8574DigitalWrite(pin, 1);
   // OUTPUT = Pcf8574DigitalWrite(pin, 0); or Pcf8574DigitalWrite(pin, 1);
-  uint32_t chip = pin / 8;
-  uint32_t bit = pin % 8;
-  uint32_t value = Pcf8574Read(chip);
-  value |= Pcf8574.pin_mask[chip];                     // Restore inputs
+  uint32_t chip = Pcf8574First(pin / 8);
+  uint32_t bit = pin - 8 * chip;                       // 0 - 15
+  uint32_t value = Pcf8574ChipRead(chip);
+  value |= Pcf8574ChipMask(chip);                      // Restore inputs
   if (pin_value) {
     value |= 1 << bit;
   } else {
     value &= ~(1 << bit);
   }
-/*
-  Wire.beginTransmission(Pcf8574.address[chip]);
-  Wire.write(value);
-  Wire.endTransmission();
-*/
-  Pcf8574WriteData(chip, value);
+  Pcf8574ChipWrite(chip, value);
 }
 
 void Pcf8574DigitalWriteConfig(uint8_t pin, bool pin_value) {
@@ -474,7 +525,7 @@ void Pcf8574CheckForInputChange(void) {
     if (input != last_input) {                         // Don't scan bits if no change (EVERY_50_MS !)
       for (uint32_t pin = 0 ; pin < 8 ; ++pin) {
         if (bitRead(input_mask,pin) && bitRead(input,pin) != bitRead(last_input,pin)) {
-          ResponseTime_P(PSTR(",\"PCF8574%c%d_INP\":{\"D%i\":%i}}"), IndexSeparator(), idx +1, pin, bitRead(input,pin));
+          ResponseTime_P(PSTR(",\"PCF8574%c%d_INP\":{\"D%i\":%i}}"), IndexSeparator(), Pcf8574Chip(idx) +1, Pcf8574PortOffset(idx) + pin, bitRead(input,pin));
           MqttPublishPrefixTopicRulesProcess_P(RESULT_OR_STAT, PSTR("PCF8574_INP"));
           if (Settings->flag3.hass_tele_on_power) {    // SetOption59 - Send tele/%topic%/SENSOR in addition to stat/%topic%/RESULT
             MqttPublishSensor();
@@ -498,7 +549,9 @@ void Pcf8574ModuleInitMode1(void) {
     uint8_t gpio = Pcf8574Read(idx);
     // Insure the input pins are actually writen a 1 for proper input operation
     Pcf8574.pin_mask[idx] = gpio | ~Settings->pcf8574_config[idx];
-    Pcf8574Write(idx);                                 // Write back to the register
+    if (Pcf8574LastBank(idx)) {                        // pin_mask of all banks of the chip are set
+      Pcf8574Write(idx);                               // Write back to the register
+    }
 #ifdef USE_PCF8574_MQTTINPUT
     Pcf8574.last_input[idx] = gpio & ~Settings->pcf8574_config[idx];
 #endif  // USE_PCF8574_MQTTINPUT
@@ -524,7 +577,7 @@ void Pcf8574ModuleInitMode1(void) {
     }
   }
   //AddLog(LOG_LEVEL_DEBUG, PSTR("PCF: Settings->power=0x%08X, TasmotaGlobal.power=0x%08X"), Settings->power, TasmotaGlobal.power);
-  AddLog(LOG_LEVEL_INFO, PSTR("PCF: Total devices %d, PCF8574 output ports %d"), Pcf8574.max_devices, Pcf8574.max_connected_ports);
+  AddLog(LOG_LEVEL_INFO, PSTR("PCF: Total devices %d, PCF8574 output ports %d"), Pcf8574.max_devices - __builtin_popcount(Pcf8574.port1), Pcf8574.max_connected_ports);
 }
 
 /*********************************************************************************************\
@@ -563,10 +616,12 @@ void HandlePcf8574(void) {
   WSContentSend_P(HTTP_FORM_I2C_PCF8574_1, (Settings->flag3.pcf8574_ports_inverted) ? PSTR(" checked") : "");  // SetOption81 - Invert all ports on PCF8574 devices
   WSContentSend_P(HTTP_TABLE100);
   for (uint32_t idx = 0; idx < Pcf8574.max_devices; idx++) {
-    for (uint32_t idx2 = 0; idx2 < 8; idx2++) {        // 8 ports on PCF8574
+    uint32_t chip = Pcf8574Chip(idx) +1;
+    uint32_t port_offset = Pcf8574PortOffset(idx);
+    for (uint32_t idx2 = 0; idx2 < 8; idx2++) {        // 8 ports per bank
       uint8_t helper = 1 << idx2;
       WSContentSend_P(HTTP_FORM_I2C_PCF8574_2,
-        idx +1, idx2,
+        chip, port_offset + idx2,
         idx2 + 8*idx,
         idx2 + 8*idx,
         ((helper & Settings->pcf8574_config[idx]) >> idx2 == 0) ? PSTR(" selected ") : " ",
@@ -622,7 +677,7 @@ void Pcf8574ShowWeb(void) {
     uint8_t gpio = Pcf8574Read(idx);
     for (uint32_t pin = 0 ; pin < 8 ; ++pin, input_mask >>= 1, gpio >>= 1) {
       if (input_mask & 1) {
-        WSContentSend_P(HTTP_SNS_PCF8574_GPIO, IndexSeparator(), idx +1, pin, gpio & 1);
+        WSContentSend_P(HTTP_SNS_PCF8574_GPIO, IndexSeparator(), Pcf8574Chip(idx) +1, Pcf8574PortOffset(idx) + pin, gpio & 1);
       }
     }
   }
@@ -634,11 +689,16 @@ void Pcf8574ShowWeb(void) {
 void Pcf8574ShowJson(void) {
   for (uint32_t idx = 0 ; idx < Pcf8574.max_devices ; idx++) {
     uint8_t gpio = Pcf8574Read(idx);
-    ResponseAppend_P(PSTR(",\"PCF8574%c%d\":{"), IndexSeparator(), idx +1);
-    for (uint32_t pin = 0; pin < 8; ++pin, gpio >>= 1) {
-      ResponseAppend_P(PSTR("%s\"D%d\":%i"), (0==pin)?"":",", pin, gpio & 1);
+    uint32_t port_offset = Pcf8574PortOffset(idx);
+    if (!port_offset) {                                // First bank of the chip
+      ResponseAppend_P(PSTR(",\"PCF8574%c%d\":{"), IndexSeparator(), Pcf8574Chip(idx) +1);
     }
-    ResponseJsonEnd();
+    for (uint32_t pin = 0; pin < 8; ++pin, gpio >>= 1) {
+      ResponseAppend_P(PSTR("%s\"D%d\":%i"), (0==port_offset + pin)?"":",", port_offset + pin, gpio & 1);
+    }
+    if (Pcf8574LastBank(idx)) {
+      ResponseJsonEnd();
+    }
   }
 }
 #endif // #ifdef USE_PCF8574_SENSOR
@@ -659,16 +719,28 @@ void Pcf8574ModuleInit(void) {
   #endif
 
         if (I2cSetDevice(pcf8574_address, bus)) {
-          Pcf8574.mode = 1;
+          bool wide = (pcf8574_address >= PCF8575_ADDR) && (pcf8574_address < PCF8575_ADDR + PCF8575_ADDR_COUNT) &&
+                      bitRead(Settings->pcf8575_mask, pcf8574_address - PCF8575_ADDR);
+          uint32_t banks = (wide) ? 2 : 1;
+          if (Pcf8574.max_devices + banks > MAX_PCF8574) {
+            AddLog(LOG_LEVEL_INFO, PSTR("PCF: No room for PCF8575 at 0x%02x"), pcf8574_address);
+          } else {
+            Pcf8574.mode = 1;
 
-          Pcf8574.max_connected_ports += 8;
-          Pcf8574.address[Pcf8574.max_devices] = pcf8574_address;
-          Pcf8574.bus[Pcf8574.max_devices] = bus;
-          Pcf8574.max_devices++;
+            Pcf8574.max_connected_ports += 8 * banks;
+            for (uint32_t bank = 0; bank < banks; bank++) {
+              if (bank) {
+                bitSet(Pcf8574.port1, Pcf8574.max_devices);  // P08-P15 of PCF8575
+              }
+              Pcf8574.address[Pcf8574.max_devices] = pcf8574_address;
+              Pcf8574.bus[Pcf8574.max_devices] = bus;
+              Pcf8574.max_devices++;
+            }
 
-          char stype[12];
-          sprintf_P(stype, PSTR("PCF8574%s"), (pcf8574_address >= PCF8574_ADDR2) ? "A" : "");
-          I2cSetActiveFound(pcf8574_address, stype, bus);
+            char stype[12];
+            sprintf_P(stype, PSTR("PCF857%s"), (wide) ? "5" : (pcf8574_address >= PCF8574_ADDR2) ? "4A" : "4");
+            I2cSetActiveFound(pcf8574_address, stype, bus);
+          }
         }
 
   #if defined(USE_MCP230xx) && defined(USE_MCP230xx_ADDR)
@@ -702,6 +774,52 @@ void Pcf8574ModuleInit(void) {
 }
 
 /*********************************************************************************************\
+ * Commands
+\*********************************************************************************************/
+
+const char kPcf8574Commands[] PROGMEM = "|"  // No prefix
+  "Pcf8575Addr";                                     // Command names can't end in a digit (parsed as index)
+
+void (* const Pcf8574Command[])(void) PROGMEM = {
+  &CmndPcf8575Addr };
+
+void CmndPcf8575Addr(void) {
+  // Pcf8575Addr            - Show addresses of PCF8575 chips
+  // Pcf8575Addr 0          - All chips are PCF8574
+  // Pcf8575Addr 0x20,0x22  - Chips at 0x20 and 0x22 are PCF8575
+  if (XdrvMailbox.data_len > 0) {
+    uint32_t mask = 0;
+    char argument[XdrvMailbox.data_len +1];
+    uint32_t argc = ArgC();
+    for (uint32_t i = 1; i <= argc; i++) {
+      char *arg = ArgV(argument, i);
+      char *end;
+      uint32_t address = strtoul(arg, &end, 0);
+      if (*end || (address && ((address < PCF8575_ADDR) || (address >= PCF8575_ADDR + PCF8575_ADDR_COUNT)))) {
+        ResponseCmndError();
+        return;
+      }
+      if (address) {
+        bitSet(mask, address - PCF8575_ADDR);
+      }
+    }
+    if (mask != Settings->pcf8575_mask) {
+      Settings->pcf8575_mask = mask;
+      TasmotaGlobal.restart_flag = 2;                  // Chips are detected at restart
+    }
+  }
+  Response_P(PSTR("{\"%s\":["), XdrvMailbox.command);
+  bool first = true;
+  for (uint32_t i = 0; i < PCF8575_ADDR_COUNT; i++) {
+    if (bitRead(Settings->pcf8575_mask, i)) {
+      ResponseAppend_P(PSTR("%s\"0x%02x\""), (first) ? "" : ",", PCF8575_ADDR + i);
+      first = false;
+    }
+  }
+  ResponseAppend_P(PSTR("]}"));
+}
+
+/*********************************************************************************************\
  * Interface
 \*********************************************************************************************/
 
@@ -712,6 +830,8 @@ bool Xdrv28(uint32_t function) {
 
   if (FUNC_SETUP_RING2 == function) {
     Pcf8574ModuleInit();
+  } else if (FUNC_COMMAND == function) {
+    result = DecodeCommand(kPcf8574Commands, Pcf8574Command);
   } else if (1 == Pcf8574.mode) {
     switch (function) {
 #ifdef USE_PCF8574_MQTTINPUT

@@ -1929,6 +1929,9 @@ void SettingsDelta(void) {
         }
       }
     }
+    if (Settings->version < 0x10000002) {  // 16.0.0.2
+      Settings->pcf8575_mask = 0;
+    }
 
     Settings->version = TASMOTA_VERSION;
     SettingsSave(1);

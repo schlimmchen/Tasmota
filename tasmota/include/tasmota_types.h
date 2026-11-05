@@ -852,10 +852,11 @@ typedef struct {
 
 #if CONFIG_IDF_TARGET_ESP32S31
   uint8_t       ws_color[4][3];            // EB0
-  uint8_t       free_esp32s31_ebc[8];      // EBC
+  uint8_t       free_esp32s31_ebc[7];      // EBC
 #else
-  uint8_t       free_eb0[20];              // EB0  20 bytes
+  uint8_t       free_eb0[19];              // EB0  19 bytes
 #endif
+  uint8_t       pcf8575_mask;              // EC3  PCF8575 at I2C address 0x20 + bit
 
   uint16_t      light_pixels_height_1 : 15;// EC4  Pixels height minus 1, default 0 (0 means 1 line)
   uint16_t      light_pixels_alternate : 1;// EC4  Indicates alternate lines in Pixels Matrix

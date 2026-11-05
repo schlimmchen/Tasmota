@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - LVGL add logging before crash when heap allocation fails (#25170)
 - BLE timeout and eQ3 TRV enhancements (#25173)
 - TuyaMCU pace outgoing frames so the MCU is never written to back-to-back (#25151)
+- PCF8574 driver support for PCF8575 16-bit I/O expander with command `Pcf8575Addr`
 
 ### Breaking Changed
 - BTHome un-reverse MAC address usage for command `MI32Keys` to make it consistent
